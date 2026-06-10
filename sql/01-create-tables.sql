@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS ods.ods_user_behavior (
 -- DIM 维度层
 -- =============================================
 
-CREATE TABLE IF NOT EXISTS dwd.dim_product (
+CREATE TABLE IF NOT EXISTS ods.dim_product (
     product_id      VARCHAR(8) PRIMARY KEY,
     product_name    VARCHAR(50),
     category        VARCHAR(20),
@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS dwd.dim_product (
     unit            VARCHAR(10)
 );
 
-CREATE TABLE IF NOT EXISTS dwd.dim_store (
+CREATE TABLE IF NOT EXISTS ods.dim_store (
     store_id        VARCHAR(8) PRIMARY KEY,
     store_name      VARCHAR(50),
     city            VARCHAR(20),
@@ -77,7 +77,7 @@ CREATE TABLE IF NOT EXISTS dwd.dim_store (
     opening_date    DATE
 );
 
-CREATE TABLE IF NOT EXISTS dwd.dim_user (
+CREATE TABLE IF NOT EXISTS ods.dim_user (
     user_id         VARCHAR(16) PRIMARY KEY,
     user_name       VARCHAR(30),
     gender          VARCHAR(4),

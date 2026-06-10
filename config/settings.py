@@ -1,14 +1,34 @@
 DB_CONFIG = {
-    "host": "127.0.0.1",
+    "host": "192.168.10.144",
     "port": 5432,
     "user": "hema_admin",
     "password": "hema2024",
     "database": "hema_fresh_dw"
 }
 
+MYSQL_CONFIG = {
+    "host": "192.168.10.144",
+    "port": 3306,
+    "user": "hema_ads",
+    "password": "hema2024",
+    "database": "hema_fresh_ads"
+}
+
+MYSQL_JDBC_URL = "jdbc:mysql://192.168.10.144:3306/hema_fresh_ads?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai"
+MYSQL_JDBC_PROPERTIES = {
+    "user": "hema_ads",
+    "password": "hema2024",
+    "driver": "com.mysql.cj.jdbc.Driver"
+}
+
 SPARK_CONFIG = {
     "app_name": "HemaFreshAnalysis",
-    "master": "local[*]",
+    "master": "yarn",
+    "spark.submit.deployMode": "client",
+    "spark.driver.host": "192.168.10.128",
+    "spark.hadoop.fs.defaultFS": "hdfs://192.168.10.128:9000",
+    "spark.executor.instances": "3",
+    "spark.executor.cores": "2",
     "spark.executor.memory": "4g",
     "spark.driver.memory": "2g",
     "spark.sql.shuffle.partitions": "200",
@@ -16,7 +36,25 @@ SPARK_CONFIG = {
     "spark.sql.adaptive.coalescePartitions.enabled": "true"
 }
 
-HDFS_BASE_PATH = "hdfs://namenode:9000/hema_fresh"
+CLUSTER_MODE = True
+
+HIVE_CONFIG = {
+    "database": "hema_fresh",
+    "warehouse_dir": "/user/hive/warehouse/hema_fresh.db"
+}
+
+HDFS_BASE_PATH = "hdfs://192.168.10.128:9000/hema_fresh"
+HDFS_RAW_DIR = HDFS_BASE_PATH + "/ods_raw"
+HDFS_DWD_DIR = HDFS_BASE_PATH + "/dwd"
+HDFS_DWS_DIR = HDFS_BASE_PATH + "/dws"
+HDFS_FEATURES_DIR = HDFS_BASE_PATH + "/features"
+
+PG_JDBC_URL = "jdbc:postgresql://192.168.10.144:5432/hema_fresh_dw"
+PG_JDBC_PROPERTIES = {
+    "user": "hema_admin",
+    "password": "hema2024",
+    "driver": "org.postgresql.Driver"
+}
 
 CITIES = ["上海", "北京", "深圳", "广州", "杭州", "成都", "武汉", "南京", "苏州", "西安"]
 

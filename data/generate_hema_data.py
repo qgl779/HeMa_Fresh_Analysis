@@ -3,13 +3,15 @@ import sys
 import csv
 import random
 import uuid
+import argparse
+import subprocess
 from datetime import datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from config.settings import (
-    CITIES, STORES, CATEGORIES, CUSTOMER_TAGS,
+    DB_CONFIG, CITIES, STORES, CATEGORIES, CUSTOMER_TAGS,
     WEEKDAY_EFFECT, SEASON_EFFECT, MEMBERSHIP_LEVELS,
     PRODUCT_BASE_PRICES, SHELF_LIFE_DAYS
 )
@@ -36,9 +38,125 @@ for category, products in CATEGORIES.items():
             "shelf_life": SHELF_LIFE_DAYS[product]
         })
 
+PG_ODS_SCHEMA = "ods"
+PG_ODS_TABLES = [
+    "dim_product",
+    "dim_store",
+    "dim_user",
+    "ods_order_info",
+    "ods_inventory_snapshot",
+    "ods_user_behavior",
+]
 
-def generate_products():
+
+def upload_to_hdfs(local_dir, hdfs_dir):
+    local_path = Path(local_dir)
+    if not local_path.is_dir():
+        print(f"[HDFS][WARN] 本地目录不存在，跳过上传: {local_dir}")
+        return
+
+    csv_files = sorted(local_path.glob("*.csv"))
+    if not csv_files:
+        print(f"[HDFS][WARN] 本地目录无 CSV 文件，跳过上传: {local_dir}")
+        return
+
+    print(f"[HDFS] 开始上传 {len(csv_files)} 个 CSV 文件 -> {hdfs_dir}")
+
+    try:
+        mkdir_res = subprocess.run(
+            ["hdfs", "dfs", "-mkdir", "-p", hdfs_dir],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True
+        )
+        if mkdir_res.returncode != 0:
+            print(f"[HDFS][ERROR] mkdir -p 失败: {mkdir_res.stderr.strip()}")
+            return
+        print(f"[HDFS][OK] 目录就绪: {hdfs_dir}")
+    except FileNotFoundError:
+        print("[HDFS][ERROR] 未找到 hdfs 命令，请确认 Hadoop 客户端已安装且在 PATH 中")
+        return
+    except Exception as e:
+        print(f"[HDFS][ERROR] mkdir 异常: {e}")
+        return
+
+    success_count = 0
+    for csv_file in csv_files:
+        try:
+            put_res = subprocess.run(
+                ["hdfs", "dfs", "-put", "-f", str(csv_file), hdfs_dir.rstrip("/") + "/"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True
+            )
+            if put_res.returncode != 0:
+                print(f"[HDFS][FAIL] {csv_file.name} 上传失败: {put_res.stderr.strip()}")
+            else:
+                print(f"[HDFS][OK] 上传成功: {csv_file.name}")
+                success_count += 1
+        except Exception as e:
+            print(f"[HDFS][FAIL] {csv_file.name} 上传异常: {e}")
+
+    print(f"[HDFS] 上传完成: 成功 {success_count}/{len(csv_files)}")
+
+
+def _get_pg_conn():
+    try:
+        import psycopg2
+    except ImportError:
+        print("[PG][ERROR] 未安装 psycopg2，请先执行: pip install psycopg2-binary")
+        return None
+    try:
+        conn = psycopg2.connect(
+            host=DB_CONFIG["host"],
+            port=DB_CONFIG["port"],
+            user=DB_CONFIG["user"],
+            password=DB_CONFIG["password"],
+            dbname=DB_CONFIG["database"],
+        )
+        conn.autocommit = False
+        return conn
+    except Exception as e:
+        print(f"[PG][ERROR] 连接失败: {e}")
+        return None
+
+
+def _pg_write_table(conn, schema, table, columns, rows, batch_size=5000):
+    import psycopg2
+    full_name = f'"{schema}"."{table}"'
+    col_str = ", ".join(f'"{c}"' for c in columns)
+    placeholders = ", ".join(["%s"] * len(columns))
+    sql_truncate = f"TRUNCATE TABLE {full_name}"
+    sql_insert = f"INSERT INTO {full_name} ({col_str}) VALUES ({placeholders})"
+
+    try:
+        cur = conn.cursor()
+        cur.execute(sql_truncate)
+        print(f"[PG] 已清空表 {full_name}")
+        total = 0
+        batch = []
+        for row in rows:
+            batch.append(row)
+            if len(batch) >= batch_size:
+                cur.executemany(sql_insert, batch)
+                total += len(batch)
+                batch = []
+        if batch:
+            cur.executemany(sql_insert, batch)
+            total += len(batch)
+        conn.commit()
+        cur.close()
+        print(f"[PG] {full_name} 写入完成: {total} 行")
+        return total
+    except Exception as e:
+        conn.rollback()
+        print(f"[PG][ERROR] 写入 {full_name} 失败: {e}")
+        raise
+
+
+def generate_products(write_pg=False, conn=None):
     filepath = DATA_DIR / "dim_product.csv"
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["product_id", "product_name", "category", "base_price",
@@ -55,14 +173,22 @@ def generate_products():
             else:
                 st = "常温"
             units = ["500g", "1kg", "250g", "300g", "盒", "袋", "瓶", "个", "份"]
-            writer.writerow([pid, p["product_name"], p["category"], p["base_price"],
-                              p["shelf_life"], supplier, random.choice(origins),
-                              st, random.choice(units)])
+            row = [pid, p["product_name"], p["category"], p["base_price"],
+                   p["shelf_life"], supplier, random.choice(origins),
+                   st, random.choice(units)]
+            writer.writerow(row)
+            rows.append(row)
     print(f"[OK] dim_product.csv — {len(PRODUCT_LIST)} products")
 
+    if write_pg and conn is not None:
+        cols = ["product_id", "product_name", "category", "base_price",
+                "shelf_life_days", "supplier", "origin", "storage_type", "unit"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "dim_product", cols, rows)
 
-def generate_stores():
+
+def generate_stores(write_pg=False, conn=None):
     filepath = DATA_DIR / "dim_store.csv"
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["store_id", "store_name", "city", "district", "area_sqm", "opening_date"])
@@ -80,12 +206,19 @@ def generate_stores():
             district = store.replace("店", "")
             area = random.randint(3000, 12000)
             open_date = (datetime(2020, 1, 1) + timedelta(days=random.randint(0, 1400))).strftime("%Y-%m-%d")
-            writer.writerow([sid, f"盒马鲜生·{store}", city, district, area, open_date])
+            row = [sid, f"盒马鲜生·{store}", city, district, area, open_date]
+            writer.writerow(row)
+            rows.append(row)
     print(f"[OK] dim_store.csv — {len(STORES)} stores")
 
+    if write_pg and conn is not None:
+        cols = ["store_id", "store_name", "city", "district", "area_sqm", "opening_date"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "dim_store", cols, rows)
 
-def generate_users():
+
+def generate_users(write_pg=False, conn=None):
     filepath = DATA_DIR / "dim_user.csv"
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["user_id", "user_name", "gender", "age", "city",
@@ -103,18 +236,25 @@ def generate_users():
             reg_date = (START_DATE - timedelta(days=random.randint(30, 730))).strftime("%Y-%m-%d")
             user_tag = random.choice(CUSTOMER_TAGS)
             ltv = round(random.uniform(200, 50000), 2)
-            writer.writerow([uid, f"用户_{uid}", gender, age, city,
-                              membership, reg_date, user_tag, ltv])
+            row = [uid, f"用户_{uid}", gender, age, city, membership, reg_date, user_tag, ltv]
+            writer.writerow(row)
+            rows.append(row)
     print(f"[OK] dim_user.csv — {NUM_USERS} users")
 
+    if write_pg and conn is not None:
+        cols = ["user_id", "user_name", "gender", "age", "city",
+                "membership", "register_date", "user_tag", "lifetime_value"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "dim_user", cols, rows)
 
-def generate_orders():
-    filepath = DATA_DIR / "fact_order.csv"
+
+def generate_orders(write_pg=False, conn=None):
+    filepath = DATA_DIR / "ods_order_info.csv"
     statuses = ["completed", "completed", "completed", "completed",
                 "completed", "refunded", "cancelled", "completed", "completed", "returned"]
     channels = ["线上-APP", "线上-小程序", "线下-门店"]
     channel_weights = [0.45, 0.25, 0.30]
 
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["order_id", "user_id", "store_id", "product_id",
@@ -160,19 +300,29 @@ def generate_orders():
                 delivery_type = "自提"
                 delivery_duration = 0
 
-            writer.writerow([oid, uid, sid, pid, order_date.strftime("%Y-%m-%d"),
-                              order_hour, quantity, unit_price, total_amount,
-                              discount_amount, pay_amount, channel, status,
-                              delivery_type, delivery_duration])
+            row = [oid, uid, sid, pid, order_date.strftime("%Y-%m-%d"),
+                   order_hour, quantity, unit_price, total_amount,
+                   discount_amount, pay_amount, channel, status,
+                   delivery_type, delivery_duration]
+            writer.writerow(row)
+            rows.append(row)
 
             if i % 100000 == 0:
                 print(f"  ... {i}/{NUM_ORDERS} orders generated")
 
-    print(f"[OK] fact_order.csv — {NUM_ORDERS} orders")
+    print(f"[OK] ods_order_info.csv — {NUM_ORDERS} orders")
+
+    if write_pg and conn is not None:
+        cols = ["order_id", "user_id", "store_id", "product_id",
+                "order_date", "order_hour", "quantity", "unit_price",
+                "total_amount", "discount_amount", "pay_amount",
+                "channel", "status", "delivery_type", "delivery_duration_min"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "ods_order_info", cols, rows)
 
 
-def generate_inventory():
-    filepath = DATA_DIR / "fact_inventory.csv"
+def generate_inventory(write_pg=False, conn=None):
+    filepath = DATA_DIR / "ods_inventory_snapshot.csv"
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["snapshot_date", "store_id", "product_id", "stock_qty",
@@ -195,25 +345,35 @@ def generate_inventory():
                     waste_reasons = ["过期", "损坏", "滞销", "退货", None]
                     waste_reason = random.choice(waste_reasons) if waste_qty > 0 else None
                     promotion_flag = 1 if random.random() < 0.15 else 0
-                    writer.writerow([snapshot_date.strftime("%Y-%m-%d"), sid, pid,
-                                      stock_qty, safety_stock, reorder_point,
-                                      waste_qty, waste_reason, promotion_flag])
+                    row = [snapshot_date.strftime("%Y-%m-%d"), sid, pid,
+                           stock_qty, safety_stock, reorder_point,
+                           waste_qty, waste_reason, promotion_flag]
+                    writer.writerow(row)
+                    rows.append(row)
 
             if day_offset % 60 == 0:
                 print(f"  ... inventory day {day_offset}/{DATE_RANGE}")
 
-    print(f"[OK] fact_inventory.csv — {DATE_RANGE * len(STORES)} snapshot days × stores")
+    print(f"[OK] ods_inventory_snapshot.csv — {len(rows)} rows")
+
+    if write_pg and conn is not None:
+        cols = ["snapshot_date", "store_id", "product_id", "stock_qty",
+                "safety_stock", "reorder_point", "waste_qty",
+                "waste_reason", "promotion_flag"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "ods_inventory_snapshot", cols, rows)
 
 
-def generate_user_behavior():
-    filepath = DATA_DIR / "fact_user_behavior.csv"
+def generate_user_behavior(write_pg=False, conn=None):
+    filepath = DATA_DIR / "ods_user_behavior.csv"
     actions = ["view", "cart", "favorite", "search", "click_banner", "view_detail", "share"]
+    total_events = NUM_ORDERS * 3
+    rows = []
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(["event_id", "user_id", "product_id", "action",
                           "event_time", "session_id", "stay_seconds", "page"])
 
-        for i in range(1, NUM_ORDERS * 3):
+        for i in range(1, total_events + 1):
             eid = f"EVT{uuid.uuid4().hex[:16]}"
             uid = f"U{random.randint(1, NUM_USERS):06d}"
             pid = f"P{random.randint(1, NUM_PRODUCTS):05d}"
@@ -224,28 +384,91 @@ def generate_user_behavior():
             session_id = f"SESS{uuid.uuid4().hex[:12]}"
             stay = random.randint(1, 300) if action == "view_detail" else random.randint(1, 60)
             page = random.choice(["首页", "分类页", "搜索页", "商品详情", "购物车", "活动页", "个人中心"])
-            writer.writerow([eid, uid, pid, action, event_time, session_id, stay, page])
+            row = [eid, uid, pid, action, event_time, session_id, stay, page]
+            writer.writerow(row)
+            rows.append(row)
 
             if i % 300000 == 0:
-                print(f"  ... {i}/{NUM_ORDERS * 3} behavior events")
+                print(f"  ... {i}/{total_events} behavior events")
 
-    print(f"[OK] fact_user_behavior.csv — {NUM_ORDERS * 3} events")
+    print(f"[OK] ods_user_behavior.csv — {total_events} events")
+
+    if write_pg and conn is not None:
+        cols = ["event_id", "user_id", "product_id", "action",
+                "event_time", "session_id", "stay_seconds", "page"]
+        _pg_write_table(conn, PG_ODS_SCHEMA, "ods_user_behavior", cols, rows)
 
 
-if __name__ == "__main__":
+def main():
+    parser = argparse.ArgumentParser(
+        description="盒马生鲜模拟数据集生成脚本（可写 PG / 上传至 HDFS）"
+    )
+    parser.add_argument(
+        "--write-pg",
+        action="store_true",
+        default=False,
+        help="生成后是否批量写入 PostgreSQL ods schema（默认: 不写）"
+    )
+    parser.add_argument(
+        "--upload-hdfs",
+        action="store_true",
+        default=False,
+        help="生成后是否上传到 HDFS（默认: 不上传）"
+    )
+    parser.add_argument(
+        "--hdfs-path",
+        type=str,
+        default="hdfs://192.168.10.128:9000/hema_fresh/ods_raw",
+        help="HDFS 目标路径（默认: hdfs://192.168.10.128:9000/hema_fresh/ods_raw）"
+    )
+    args = parser.parse_args()
+
     print("=== 盒马生鲜模拟数据集生成 ===")
     print(f"时间范围: {START_DATE.date()} ~ {END_DATE.date()}")
     print(f"生成目录: {DATA_DIR}")
+    print(f"写入 PG: {'开启' if args.write_pg else '关闭'}")
+    if args.write_pg:
+        print(f"  -> host={DB_CONFIG['host']} db={DB_CONFIG['database']} schema={PG_ODS_SCHEMA}")
+        print(f"  -> 目标表: {', '.join(PG_ODS_TABLES)}")
+    if args.upload_hdfs:
+        print(f"HDFS 目标: {args.hdfs_path}")
+    else:
+        print("HDFS 目标: 不开启（如需上传，请加 --upload-hdfs）")
     print()
-    generate_products()
-    generate_stores()
-    generate_users()
-    generate_orders()
-    generate_inventory()
-    generate_user_behavior()
+
+    conn = None
+    if args.write_pg:
+        conn = _get_pg_conn()
+        if conn is None:
+            print("[PG][ERROR] 无法连接到 PostgreSQL，将跳过 --write-pg 步骤，但仍会生成 CSV")
+            args.write_pg = False
+
+    try:
+        generate_products(write_pg=args.write_pg, conn=conn)
+        generate_stores(write_pg=args.write_pg, conn=conn)
+        generate_users(write_pg=args.write_pg, conn=conn)
+        generate_orders(write_pg=args.write_pg, conn=conn)
+        generate_inventory(write_pg=args.write_pg, conn=conn)
+        generate_user_behavior(write_pg=args.write_pg, conn=conn)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+                print("[PG] 连接已关闭")
+            except Exception:
+                pass
+
     print()
     print("=== 全部数据集生成完毕 ===")
     print(f"文件列表:")
     for f in sorted(DATA_DIR.glob("*.csv")):
         size_mb = f.stat().st_size / (1024 * 1024)
-        print(f"  {f.name:<30s} {size_mb:.2f} MB")
+        print(f"  {f.name:<35s} {size_mb:.2f} MB")
+
+    if args.upload_hdfs:
+        print()
+        upload_to_hdfs(str(DATA_DIR), args.hdfs_path)
+
+
+if __name__ == "__main__":
+    main()
